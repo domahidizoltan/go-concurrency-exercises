@@ -13,10 +13,27 @@
 
 package main
 
+import (
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+)
+
 func main() {
+	shutdownSignal := make(chan os.Signal, 2)
+	signal.Notify(shutdownSignal, syscall.SIGINT)
+
 	// Create a process
 	proc := MockProcess{}
 
 	// Run the process (blocking)
-	proc.Run()
+	go proc.Run()
+
+	<-shutdownSignal
+	go proc.Stop()
+
+	<-shutdownSignal
+	fmt.Printf("\nKilling process!\n")
+	os.Exit(1)
 }
