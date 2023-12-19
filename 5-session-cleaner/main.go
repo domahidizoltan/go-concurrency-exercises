@@ -20,12 +20,21 @@ package main
 import (
 	"errors"
 	"log"
+	"strconv"
+	"sync"
+	"time"
 )
+
+const ttlSeconds = 5
 
 // SessionManager keeps track of all sessions from creation, updating
 // to destroying.
 type SessionManager struct {
-	sessions map[string]Session
+	sessions              map[string]Session
+	sessionExpirations    map[string]time.Time
+	expirationChecks      map[string][]string
+	expirationCheckTicker *time.Ticker
+	mutex                 sync.RWMutex
 }
 
 // Session stores the session's data
@@ -36,8 +45,13 @@ type Session struct {
 // NewSessionManager creates a new sessionManager
 func NewSessionManager() *SessionManager {
 	m := &SessionManager{
-		sessions: make(map[string]Session),
+		sessions:              make(map[string]Session),
+		sessionExpirations:    make(map[string]time.Time),
+		expirationChecks:      make(map[string][]string),
+		expirationCheckTicker: time.NewTicker(time.Second),
 	}
+
+	go m.removeExpiredSessionsWorker()
 
 	return m
 }
@@ -49,9 +63,14 @@ func (m *SessionManager) CreateSession() (string, error) {
 		return "", err
 	}
 
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
 	m.sessions[sessionID] = Session{
 		Data: make(map[string]interface{}),
 	}
+
+	m.updateSessionExpiration(sessionID)
 
 	return sessionID, nil
 }
@@ -63,6 +82,8 @@ var ErrSessionNotFound = errors.New("SessionID does not exists")
 // GetSessionData returns data related to session if sessionID is
 // found, errors otherwise
 func (m *SessionManager) GetSessionData(sessionID string) (map[string]interface{}, error) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
 	session, ok := m.sessions[sessionID]
 	if !ok {
 		return nil, ErrSessionNotFound
@@ -72,17 +93,60 @@ func (m *SessionManager) GetSessionData(sessionID string) (map[string]interface{
 
 // UpdateSessionData overwrites the old session data with the new one
 func (m *SessionManager) UpdateSessionData(sessionID string, data map[string]interface{}) error {
+	m.mutex.RLock()
 	_, ok := m.sessions[sessionID]
 	if !ok {
+		m.mutex.RUnlock()
 		return ErrSessionNotFound
 	}
+	m.mutex.RUnlock()
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
 	// Hint: you should renew expiry of the session here
 	m.sessions[sessionID] = Session{
 		Data: data,
 	}
 
+	m.updateSessionExpiration(sessionID)
+
 	return nil
+}
+
+func (m *SessionManager) updateSessionExpiration(sessionID string) {
+	expireAt := time.Now().Add(ttlSeconds * time.Second)
+	m.sessionExpirations[sessionID] = expireAt
+	key := strconv.Itoa(expireAt.Second())
+	m.expirationChecks[key] = append(m.expirationChecks[key], sessionID)
+}
+
+func (m *SessionManager) removeExpiredSessionsWorker() {
+	for range m.expirationCheckTicker.C {
+		now := time.Now()
+		key := strconv.Itoa(now.Second())
+
+		m.mutex.RLock()
+		expiredSessionIDs := []string{}
+		for _, sID := range m.expirationChecks[key] {
+			if exp, ok := m.sessionExpirations[sID]; ok {
+				exp = exp.Add(-10 * time.Millisecond)
+				if exp.Before(now) {
+					expiredSessionIDs = append(expiredSessionIDs, sID)
+				}
+
+			}
+		}
+		m.mutex.RUnlock()
+
+		m.mutex.Lock()
+		for _, sID := range expiredSessionIDs {
+			delete(m.sessions, sID)
+			delete(m.sessionExpirations, sID)
+		}
+		delete(m.expirationChecks, key)
+		m.mutex.Unlock()
+	}
 }
 
 func main() {
